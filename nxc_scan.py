@@ -251,10 +251,29 @@ def build_cmd(nxc_bin: str, args: list[str], host_file: Path,
 
 
 # ── Auth flags ────────────────────────────────────────────────────────────────
+def _kcache_flag(nxc_bin: str) -> str:
+    """Return whichever ccache flag this nxc build accepts."""
+    # Try --use-kcache first (newer builds), fall back to --use-ccache
+    try:
+        out = subprocess.run(
+            [nxc_bin, "smb", "--help"],
+            capture_output=True, text=True, timeout=5
+        ).stdout + subprocess.run(
+            [nxc_bin, "smb", "--help"],
+            capture_output=True, text=True, timeout=5
+        ).stderr
+        if "--use-kcache" in out:
+            return "--use-kcache"
+    except Exception:
+        pass
+    return "--use-ccache"
+
+
 def auth_args(cfg: dict) -> list[str]:
     mode = cfg["auth_mode"]
     if mode == "kcache":
-        return ["--use-kcache", "-k"]
+        flag = cfg.get("kcache_flag", "--use-kcache")
+        return [flag, "-k"]
     elif mode == "hash":
         return ["-u", cfg["username"], "-H", cfg["hash"]]
     else:
@@ -355,47 +374,165 @@ def run_concurrent(jobs: list[tuple], cfg: dict, output_dir: Path,
     return results
 
 
-# ── Pre-auth check ────────────────────────────────────────────────────────────
-def precheck(cfg: dict, proto_hosts: dict, host_files: dict) -> dict[str, bool]:
-    section("STAGE 2 — Pre-auth credential check")
-    auth   = auth_args(cfg)
-    domain = domain_args(cfg)
-    status: dict[str, bool] = {}
+# ── Credential test (single proto, single host) ───────────────────────────────
+def _test_creds(cfg: dict, proto: str, host: str) -> bool:
+    """Run a quick nxc auth check. Returns True on [+] or Pwn3d!"""
+    cmd = [cfg["nxc_bin"], proto, host] + auth_args(cfg) + domain_args(cfg)
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True,
+                             timeout=30).stdout
+        return bool(re.search(r"\[\+\]", out)) or "Pwn3d!" in out
+    except Exception:
+        return False
 
-    for proto in ["smb", "ldap", "mssql", "ssh", "winrm", "rdp", "ftp", "wmi", "vnc"]:
-        if proto not in proto_hosts:
-            continue
-        test_host = proto_hosts[proto][0]
-        cmd = [cfg["nxc_bin"], proto, test_host] + auth + domain
-        info(f"[{proto}] Testing against {test_host} ...")
-        try:
-            out = subprocess.run(cmd, capture_output=True, text=True,
-                                 timeout=30).stdout
-        except Exception:
-            out = ""
 
-        if re.search(r"\[\+\]", out) or "Pwn3d!" in out:
-            ok(f"[{proto}] {G}{B}Authentication SUCCESS{RST}")
-            status[proto] = True
-        else:
-            fail(f"[{proto}] Authentication FAILED / unclear")
-            status[proto] = False
+# ── Re-enter credentials interactively ───────────────────────────────────────
+def _collect_auth_interactive(cfg: dict) -> dict:
+    """Ask for new credentials and return updated cfg. Does not mutate original."""
+    c = dict(cfg)
+    print(f"\n{B}Choose a different authentication method:{RST}")
+    print("  1) Password")
+    print("  2) NTLM Hash  (Pass-the-Hash)")
+    print("  3) Kerberos ccache  (--use-kcache / --use-ccache)")
+    print("  4) Generate TGT from password")
+    print("  q) Quit")
+    choice = input(f"{B}Choice [1-4/q]:{RST} ").strip().lower()
 
-    # Summary table
-    print(f"\n  {B}Pre-auth summary:{RST}")
-    print(f"  {'Protocol':<12} Status")
-    print(f"  {'────────':<12} ──────")
-    for proto in sorted(status):
-        if status[proto]:
-            print(f"  {G}{proto:<12} ✓ Success{RST}")
-        else:
-            print(f"  {Y}{proto:<12} ✗ Failed / unclear{RST}")
-
-    cont = input(f"\n{B}Continue with module scanning? [Y/n]: {RST}").strip().lower()
-    if cont == "n":
+    if choice == "q":
         print("Aborted."); sys.exit(0)
 
-    return status
+    elif choice == "1":
+        c["auth_mode"] = "password"
+        c["username"]  = input(f"{B}Username:{RST} ").strip()
+        c["password"]  = getpass(f"{B}Password:{RST} ")
+
+    elif choice == "2":
+        c["auth_mode"] = "hash"
+        c["username"]  = input(f"{B}Username:{RST} ").strip()
+        c["hash"]      = input(f"{B}NTLM Hash (LM:NT or NT):{RST} ").strip()
+
+    elif choice == "3":
+        c["auth_mode"]    = "kcache"
+        c["username"]     = input(f"{B}Username (display only):{RST} ").strip()
+        c["kcache_flag"]  = cfg.get("kcache_flag", "--use-kcache")
+
+        existing = os.environ.get("KRB5CCNAME", "")
+        if existing:
+            info(f"KRB5CCNAME currently set to: {existing}")
+            keep = input(f"{B}Use this ccache? [Y/n]:{RST} ").strip().lower()
+            if keep == "n":
+                existing = ""
+
+        if not existing:
+            while True:
+                cc = input(f"{B}Path to .ccache file:{RST} ").strip()
+                if Path(cc).exists():
+                    os.environ["KRB5CCNAME"] = cc
+                    ok(f"KRB5CCNAME set to {cc}")
+                    break
+                else:
+                    fail(f"File not found: {cc}")
+                    retry = input(f"{B}Try again? [Y/n]:{RST} ").strip().lower()
+                    if retry == "n":
+                        print("Aborted."); sys.exit(0)
+
+    elif choice == "4":
+        c["auth_mode"] = "password"
+        c["username"]  = input(f"{B}Username:{RST} ").strip()
+        c["password"]  = getpass(f"{B}Password:{RST} ")
+        tgt_dc = c.get("kdc_ip") or input(f"{B}DC IP for TGT request:{RST} ").strip()
+        Path(c["output_dir"]).mkdir(parents=True, exist_ok=True)
+        tgt_file = str(Path(c["output_dir"]) / f"{c['username']}.ccache")
+        info(f"Requesting TGT from {tgt_dc} → {tgt_file}")
+        subprocess.run(
+            [c["nxc_bin"], "smb", tgt_dc,
+             "-u", c["username"], "-p", c["password"], "--gen-tgt", tgt_file],
+            check=False
+        )
+        if Path(tgt_file).exists():
+            os.environ["KRB5CCNAME"] = tgt_file
+            c["auth_mode"]   = "kcache"
+            c["kcache_flag"] = cfg.get("kcache_flag", "--use-kcache")
+            ok(f"TGT saved. KRB5CCNAME={tgt_file}")
+        else:
+            warn("TGT generation failed — falling back to password auth.")
+
+    else:
+        warn("Invalid choice — keeping current credentials.")
+
+    return c
+
+
+# ── Pre-auth check with retry loop ───────────────────────────────────────────
+def precheck(cfg: dict, proto_hosts: dict, host_files: dict) -> tuple[dict, dict[str, bool]]:
+    """
+    Test credentials against one host per discovered protocol.
+    If any protocol fails, offers the user a chance to re-enter creds and retry.
+    Returns (possibly updated cfg, {proto: bool} status map).
+    """
+    section("STAGE 2 — Pre-auth credential check")
+
+    # Pick the best test protocol — SMB first as it's most reliable
+    test_order = ["smb", "ldap", "winrm", "mssql", "ssh", "ftp", "rdp", "wmi", "vnc"]
+
+    while True:
+        # ── Run one quick test per available protocol ─────────────────────────
+        status: dict[str, bool] = {}
+        for proto in test_order:
+            if proto not in proto_hosts:
+                continue
+            test_host = proto_hosts[proto][0]
+            info(f"[{proto}] Testing credentials against {test_host} ...")
+            result = _test_creds(cfg, proto, test_host)
+            if result:
+                ok(f"[{proto}] {G}{B}SUCCESS{RST} on {test_host}")
+            else:
+                fail(f"[{proto}] FAILED on {test_host}")
+            status[proto] = result
+
+        # ── Summary table ─────────────────────────────────────────────────────
+        any_ok   = any(status.values())
+        any_fail = not all(status.values())
+
+        print(f"\n  {B}Pre-auth summary:{RST}")
+        print(f"  {'Protocol':<12} {'Host':<20} Status")
+        print(f"  {'────────':<12} {'────':<20} ──────")
+        for proto in sorted(status):
+            host = proto_hosts[proto][0]
+            if status[proto]:
+                print(f"  {G}{proto:<12} {host:<20} ✓ Success{RST}")
+            else:
+                print(f"  {R}{proto:<12} {host:<20} ✗ Failed{RST}")
+
+        # ── Decision ──────────────────────────────────────────────────────────
+        if any_ok and not any_fail:
+            # All protocols authenticated — proceed
+            print("")
+            ok("All credential checks passed.")
+            break
+
+        print("")
+        if any_ok:
+            warn("Some protocols failed authentication.")
+        else:
+            warn("All credential checks failed.")
+
+        print(f"\n{B}What would you like to do?{RST}")
+        print("  1) Continue anyway  (failed modules will produce no output)")
+        print("  2) Re-enter credentials and retry")
+        print("  3) Quit")
+        action = input(f"{B}Choice [1-3]:{RST} ").strip()
+
+        if action == "1":
+            break
+        elif action == "2":
+            cfg = _collect_auth_interactive(cfg)
+            info("Retrying credential checks with new auth...")
+            continue
+        else:
+            print("Aborted."); sys.exit(0)
+
+    return cfg, status
 
 
 # ── Listener management ───────────────────────────────────────────────────────
@@ -553,8 +690,18 @@ def wizard(args) -> dict:
         cfg["username"]  = args.username
         cfg["hash"]      = args.hash
     elif args.use_kcache:
-        cfg["auth_mode"] = "kcache"
-        cfg["username"]  = args.username or ""
+        cfg["auth_mode"]   = "kcache"
+        cfg["kcache_flag"] = _kcache_flag(cfg["nxc_bin"])
+        cfg["username"]    = args.username or ""
+        # Validate KRB5CCNAME is set and the file exists
+        cc = os.environ.get("KRB5CCNAME", "")
+        if not cc:
+            fail("KRB5CCNAME is not set. Please export KRB5CCNAME=/path/to/file.ccache")
+            sys.exit(1)
+        if not Path(cc).exists():
+            fail(f"ccache file not found: {cc}")
+            sys.exit(1)
+        ok(f"Using ccache: {cc}  (flag: {cfg['kcache_flag']})")
     else:
         print(f"\n{B}Authentication mode:{RST}")
         print("  1) Password  2) NTLM Hash  3) Kerberos ccache  4) Generate TGT")
@@ -565,11 +712,29 @@ def wizard(args) -> dict:
             cfg["username"]  = input(f"{B}Username:{RST} ").strip()
             cfg["hash"]      = input(f"{B}NTLM Hash:{RST} ").strip()
         elif choice == "3":
-            cfg["auth_mode"] = "kcache"
-            cfg["username"]  = input(f"{B}Username (display):{RST} ").strip()
-            if not os.environ.get("KRB5CCNAME"):
-                cc = input(f"{B}KRB5CCNAME path:{RST} ").strip()
-                os.environ["KRB5CCNAME"] = cc
+            cfg["auth_mode"]   = "kcache"
+            cfg["kcache_flag"] = _kcache_flag(cfg["nxc_bin"])
+            cfg["username"]    = input(f"{B}Username (display only):{RST} ").strip()
+
+            existing = os.environ.get("KRB5CCNAME", "")
+            if existing:
+                info(f"KRB5CCNAME already set: {existing}")
+                keep = input(f"{B}Use this ccache? [Y/n]:{RST} ").strip().lower()
+                if keep == "n":
+                    existing = ""
+
+            if not existing:
+                while True:
+                    cc = input(f"{B}Path to .ccache file:{RST} ").strip()
+                    if Path(cc).exists():
+                        os.environ["KRB5CCNAME"] = cc
+                        ok(f"KRB5CCNAME set to {cc}")
+                        break
+                    else:
+                        fail(f"File not found: {cc}")
+                        retry = input(f"{B}Try again? [Y/n]:{RST} ").strip().lower()
+                        if retry == "n":
+                            print("Aborted."); sys.exit(0)
         elif choice == "4":
             cfg["auth_mode"] = "password"
             cfg["username"]  = input(f"{B}Username:{RST} ").strip()
@@ -583,7 +748,8 @@ def wizard(args) -> dict:
                             "--gen-tgt", tgt_file], check=False)
             if Path(tgt_file).exists():
                 os.environ["KRB5CCNAME"] = tgt_file
-                cfg["auth_mode"] = "kcache"
+                cfg["auth_mode"]   = "kcache"
+                cfg["kcache_flag"] = _kcache_flag(cfg["nxc_bin"])
                 ok(f"TGT saved. KRB5CCNAME={tgt_file}")
             else:
                 warn("TGT failed, using password auth.")
@@ -681,7 +847,7 @@ Examples:
     host_files = write_host_files(proto_hosts, output_dir)
 
     # ── Stage 2: pre-auth check ───────────────
-    precheck(cfg, proto_hosts, host_files)
+    cfg, _auth_status = precheck(cfg, proto_hosts, host_files)
 
     # ── Start listener ────────────────────────
     listener = Listener()
