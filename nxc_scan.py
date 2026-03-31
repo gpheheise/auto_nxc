@@ -202,28 +202,46 @@ def detect_local_ip() -> str:
 
 # ── nmap parser ───────────────────────────────────────────────────────────────
 def parse_nmap_dir(nmap_dir: Path) -> dict[str, list[str]]:
-    """Returns {proto: [host, host, ...]} based on open ports in nmap files."""
-    proto_hosts: dict[str, list[str]] = {p: [] for p in PROTO_PORTS}
+    """
+    Returns {proto: [host, host, ...]} based on open ports in nmap -oN files.
 
-    for nmap_file in nmap_dir.iterdir():
+    Host identity = the filename (e.g. '10.252.90.4' or 'dc01.corp.local').
+    This is always clean because nmap_scan.sh names files directly from scope.txt.
+    Parsing the report header for the host is unreliable because:
+      - 'dc01.corp.local (10.252.90.5)' → rstrip(')') breaks the IP regex
+      - the bracketed IP gets passed to nxc as a malformed string
+    """
+    proto_hosts: dict[str, list[str]] = {p: [] for p in PROTO_PORTS}
+    skipped = []
+    parsed = []
+
+    for nmap_file in sorted(nmap_dir.iterdir()):
         if not nmap_file.is_file():
             continue
+
         text = nmap_file.read_text(errors="replace")
-        m = re.search(r"^Nmap scan report for (.+)$", text, re.MULTILINE)
-        if not m:
+
+        # Skip any non-nmap files in the folder (reports, lock files, etc.)
+        if "Nmap scan report for" not in text:
+            skipped.append(nmap_file.name)
             continue
-        host = m.group(1).strip().rstrip(")")
-        # strip bracketed IP if FQDN: "host.local (10.0.0.1)" → "10.0.0.1"
-        ip_match = re.search(r"\((\d+\.\d+\.\d+\.\d+)\)$", host)
-        if ip_match:
-            host = ip_match.group(1)
+
+        # Filename IS the host — exactly as written in scope.txt
+        host = nmap_file.name
+        parsed.append(host)
 
         for proto, ports in PROTO_PORTS.items():
             for port in ports:
-                if re.search(rf"^{port}/tcp\s+open", text, re.MULTILINE):
+                # Allow optional leading whitespace — some nmap versions indent
+                if re.search(rf"^\s*{port}/tcp\s+open", text, re.MULTILINE):
                     if host not in proto_hosts[proto]:
                         proto_hosts[proto].append(host)
-                    break
+                    break  # one matching port is enough for this protocol
+
+    info(f"Parsed {len(parsed)} nmap file(s), skipped {len(skipped)} non-nmap file(s)")
+    if skipped:
+        for s in skipped:
+            warn(f"  Skipped: {s}")
 
     return {p: h for p, h in proto_hosts.items() if h}
 
