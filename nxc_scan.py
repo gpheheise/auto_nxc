@@ -200,6 +200,75 @@ def detect_local_ip() -> str:
     return "127.0.0.1"
 
 
+# ── Discovery summary ─────────────────────────────────────────────────────────
+def print_discovery_summary(proto_hosts: dict):
+    """
+    Print a full table of every discovered host, which ports were found open,
+    and which nxc modules will run against it.
+    """
+    # Protocol → module count lookup
+    MODULE_COUNTS = {
+        "smb":    len(SMB_MODULES_LOWPRIV) + len(SMB_VULN_MODULES),
+        "ldap":   len(LDAP_MODULES),
+        "mssql":  len(MSSQL_MODULES),
+        "ssh":    len(OTHER_PROTO_MODULES.get("ssh", [])),
+        "winrm":  len(WINRM_MODULES_LOWPRIV),
+        "rdp":    len(OTHER_PROTO_MODULES.get("rdp", [])),
+        "ftp":    len(OTHER_PROTO_MODULES.get("ftp", [])),
+        "wmi":    len(OTHER_PROTO_MODULES.get("wmi", [])),
+        "vnc":    len(OTHER_PROTO_MODULES.get("vnc", [])),
+        "nfs":    len(OTHER_PROTO_MODULES.get("nfs", [])),
+    }
+
+    # Invert proto_hosts → {host: [proto, proto, ...]}
+    host_protos: dict[str, list[str]] = {}
+    for proto, hosts in proto_hosts.items():
+        for host in hosts:
+            host_protos.setdefault(host, []).append(proto)
+
+    total_hosts   = len(host_protos)
+    total_modules = sum(
+        MODULE_COUNTS.get(proto, 0)
+        for protos in host_protos.values()
+        for proto in protos
+    )
+
+    section("STAGE 1 — Discovery Summary")
+
+    # ── Per-host table ────────────────────────
+    col_host  = max((len(h) for h in host_protos), default=10)
+    col_host  = max(col_host, 20)
+    col_proto = 40
+
+    print(f"\n  {B}{'Host':<{col_host}}  {'Protocols / Ports':<{col_proto}}  Modules{RST}")
+    print(f"  {'─'*col_host}  {'─'*col_proto}  {'─'*7}")
+
+    for host in sorted(host_protos):
+        protos = sorted(host_protos[host])
+        # Build "smb(445) ldap(389,636) ..." string
+        proto_str = "  ".join(
+            f"{p}({','.join(str(x) for x in PROTO_PORTS[p])})"
+            for p in protos
+        )
+        mod_count = sum(MODULE_COUNTS.get(p, 0) for p in protos)
+        print(f"  {G}{host:<{col_host}}{RST}  {proto_str:<{col_proto}}  {mod_count}")
+
+    print(f"\n  {'─'*(col_host + col_proto + 12)}")
+    print(f"  {B}Total hosts   : {total_hosts}{RST}")
+    print(f"  {B}Total protocols found across all hosts:{RST}")
+
+    # ── Per-protocol summary ──────────────────
+    for proto in sorted(proto_hosts):
+        hosts  = proto_hosts[proto]
+        ports  = ", ".join(str(p) for p in PROTO_PORTS[proto])
+        mcount = MODULE_COUNTS.get(proto, 0)
+        print(f"    {C}{proto:<8}{RST}  {len(hosts):>2} host(s)  ports: {ports:<20}  {mcount} module(s)")
+
+    print(f"\n  {B}Estimated modules to run : ~{total_modules}{RST}  "
+          f"{Y}(admin modules not counted — use --smb-all to add them){RST}")
+    print()
+
+
 # ── nmap parser ───────────────────────────────────────────────────────────────
 def parse_nmap_dir(nmap_dir: Path) -> dict[str, list[str]]:
     """
@@ -922,8 +991,8 @@ Examples:
     if not proto_hosts:
         fail("No open hosts found in nmap output. Exiting."); sys.exit(1)
 
-    for proto, hosts in proto_hosts.items():
-        ok(f"[{proto}] {len(hosts)} host(s): {', '.join(hosts)}")
+    # ── Discovery summary ─────────────────────
+    print_discovery_summary(proto_hosts)
 
     host_files = write_host_files(proto_hosts, output_dir)
 
